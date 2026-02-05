@@ -5,9 +5,12 @@
 #include <cstring>
 #include <cstdio>
 #include <cerrno>
+#include <cstdlib>
+#include <string>
 #include <vector>
 #include <sys/select.h>
 #include <sys/time.h>
+#include <cctype>
 
 #include <gbm.h>
 #include <xf86drm.h>
@@ -20,7 +23,6 @@ static drmModeConnector* find_connected_connector(int fd, drmModeRes* res, bool 
       std::fprintf(stderr, "[drm_gbm_egl] probing connector %d/%d (id=%u)\n", i + 1, res->count_connectors, res->connectors[i]);
       std::fflush(stderr);
     }
-
     drmModeConnector* conn = drmModeGetConnectorCurrent(fd, res->connectors[i]);
     if (!conn) conn = drmModeGetConnector(fd, res->connectors[i]);
     if (!conn) continue;
@@ -28,6 +30,86 @@ static drmModeConnector* find_connected_connector(int fd, drmModeRes* res, bool 
     drmModeFreeConnector(conn);
   }
   return nullptr;
+}
+
+static bool choose_mode_override(drmModeConnector* conn, const char* mode_override, drmModeModeInfo& out) {
+  if (!conn || conn->count_modes <= 0) return false;
+  if (!mode_override || !mode_override[0]) return false;
+
+  std::string s(mode_override);
+  // trim
+  size_t b = 0;
+  while (b < s.size() && std::isspace((unsigned char)s[b])) b++;
+  size_t e = s.size();
+  while (e > b && std::isspace((unsigned char)s[e - 1])) e--;
+  s = s.substr(b, e - b);
+  if (s.empty()) return false;
+
+  auto vrefresh = [](const drmModeModeInfo& m) -> int {
+    if (m.vrefresh) return (int)m.vrefresh;
+    if (m.htotal && m.vtotal) return (int)((m.clock * 1000) / (m.htotal * m.vtotal));
+    return 0;
+  };
+
+  // Format: WxH or WxH@R
+  int req_w = -1;
+  int req_h = -1;
+  int req_r = -1;
+  {
+    size_t x = s.find('x');
+    if (x != std::string::npos && x > 0) {
+      size_t at = s.find('@', x + 1);
+      const std::string sw = s.substr(0, x);
+      const std::string sh = (at == std::string::npos) ? s.substr(x + 1) : s.substr(x + 1, at - (x + 1));
+      bool ok = !sw.empty() && !sh.empty();
+      for (char c : sw) ok = ok && std::isdigit((unsigned char)c);
+      for (char c : sh) ok = ok && std::isdigit((unsigned char)c);
+      if (ok) {
+        req_w = std::atoi(sw.c_str());
+        req_h = std::atoi(sh.c_str());
+        if (at != std::string::npos) {
+          const std::string sr = s.substr(at + 1);
+          bool okr = !sr.empty();
+          for (char c : sr) okr = okr && std::isdigit((unsigned char)c);
+          if (okr) req_r = std::atoi(sr.c_str());
+        }
+      }
+    }
+  }
+
+  // If it isn't WxH[[@]Hz], treat it as a mode name (e.g. "3840x2160").
+  if (req_w < 0 || req_h < 0) {
+    for (int i = 0; i < conn->count_modes; i++) {
+      const drmModeModeInfo& m = conn->modes[i];
+      if (s == m.name) {
+        out = m;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  int best = -1;
+  int best_vr = 0;
+  for (int i = 0; i < conn->count_modes; i++) {
+    const drmModeModeInfo& m = conn->modes[i];
+    if ((int)m.hdisplay != req_w || (int)m.vdisplay != req_h) continue;
+    const int vr = vrefresh(m);
+    if (req_r >= 0) {
+      if (vr != req_r) continue;
+      out = m;
+      return true;
+    }
+    if (best < 0 || vr > best_vr) {
+      best = i;
+      best_vr = vr;
+    }
+  }
+  if (best >= 0) {
+    out = conn->modes[best];
+    return true;
+  }
+  return false;
 }
 
 static drmModeEncoder* find_encoder(int fd, drmModeRes* res, drmModeConnector* conn) {
@@ -51,6 +133,29 @@ static bool choose_mode(drmModeConnector* conn, drmModeModeInfo& out) {
     if (m.htotal && m.vtotal) return (int)((m.clock * 1000) / (m.htotal * m.vtotal));
     return 0;
   };
+
+  auto better = [&](const drmModeModeInfo& cand, const drmModeModeInfo& best) -> bool {
+    const uint64_t cp = (uint64_t)cand.hdisplay * (uint64_t)cand.vdisplay;
+    const uint64_t bp = (uint64_t)best.hdisplay * (uint64_t)best.vdisplay;
+    if (cp != bp) return cp > bp;
+    if (cand.hdisplay != best.hdisplay) return cand.hdisplay > best.hdisplay;
+    if (cand.vdisplay != best.vdisplay) return cand.vdisplay > best.vdisplay;
+    const int cvr = vrefresh(cand);
+    const int bvr = vrefresh(best);
+    return cvr > bvr;
+  };
+
+  // First: prefer connector "preferred" modes.
+  int preferred_best = -1;
+  for (int i = 0; i < conn->count_modes; i++) {
+    const drmModeModeInfo& m = conn->modes[i];
+    if ((m.type & DRM_MODE_TYPE_PREFERRED) == 0) continue;
+    if (preferred_best < 0 || better(m, conn->modes[preferred_best])) preferred_best = i;
+  }
+  if (preferred_best >= 0) {
+    out = conn->modes[preferred_best];
+    return true;
+  }
 
   int best = 0;
   uint64_t best_pixels = (uint64_t)conn->modes[0].hdisplay * (uint64_t)conn->modes[0].vdisplay;
@@ -185,7 +290,7 @@ static bool create_gbm_and_egl_surface(GbmEglDrm& ctx) {
   return true;
 }
 
-bool init_drm_gbm_egl(GbmEglDrm& ctx, const char* drm_node) {
+bool init_drm_gbm_egl(GbmEglDrm& ctx, const char* drm_node, const char* mode_override) {
   if (ctx.debug) {
     std::fprintf(stderr, "[drm_gbm_egl] open drm node %s\n", drm_node);
     std::fflush(stderr);
@@ -226,7 +331,18 @@ bool init_drm_gbm_egl(GbmEglDrm& ctx, const char* drm_node) {
   }
 
   drmModeModeInfo mode{};
-  if (!choose_mode(conn, mode)) {
+  if (mode_override && mode_override[0]) {
+    if (ctx.debug) {
+      std::fprintf(stderr, "[drm_gbm_egl] mode override requested: %s\n", mode_override);
+      std::fflush(stderr);
+    }
+    if (!choose_mode_override(conn, mode_override, mode)) {
+      std::fprintf(stderr, "[drm_gbm_egl] mode override not found: %s\n", mode_override);
+      drmModeFreeConnector(conn);
+      drmModeFreeResources(res);
+      return false;
+    }
+  } else if (!choose_mode(conn, mode)) {
     drmModeFreeConnector(conn);
     drmModeFreeResources(res);
     return false;

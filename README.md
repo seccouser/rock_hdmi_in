@@ -80,11 +80,35 @@ sudo ./build/rock5b_hdmiin_gl --profile Profile_4x4
 sudo ./build/rock5b_hdmiin_gl --video /dev/video0 --drm /dev/dri/card0 --profile Profile_4x4
 ```
 
+### DRM mode override
+
+By default the DRM/KMS mode is auto-selected from the connected monitor (preferred mode if available).
+
+You can override this with:
+
+- `--mode WxH` (e.g. `1920x1080`)
+- `--mode WxH@Hz` (e.g. `1920x1080@60`)
+- `--mode <mode_name>` (matches `drmModeModeInfo.name`)
+
+Example:
+
+```bash
+sudo ./build/rock5b_hdmiin_gl /dev/video0 --mode 1920x1080@60
+```
+
 ### Debug logs
 
 ```bash
 sudo ./build/rock5b_hdmiin_gl /dev/video0 --debug
 ```
+
+## Notes
+
+- The DRM/KMS output mode is auto-selected from the connected monitor.
+  - Preferred mode (DRM flag) is chosen if present.
+  - Otherwise the highest resolution (then highest refresh) is selected.
+- On some Rockchip HDMI-RX setups, **1080p/FHD input** may negotiate as **NV24** (YUV444) instead of NV12.
+  - This project supports NV24 and uses dmabuf/EGLImage zero-copy when available.
 
 ## Global config file
 

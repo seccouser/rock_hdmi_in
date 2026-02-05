@@ -18,6 +18,133 @@ static int xioctl(int fd, unsigned long request, void* arg) {
   return r;
 }
 
+static void yuv_to_rgb(int Y, int U, int V, uint8_t& r, uint8_t& g, uint8_t& b);
+
+bool nv24_to_rgb24(const uint8_t* y_plane, const uint8_t* uv_plane, uint32_t width, uint32_t height,
+                   uint32_t y_stride, uint32_t uv_stride, bool uv_swap, std::vector<uint8_t>& rgb_out) {
+  if (!y_plane || !uv_plane || width == 0 || height == 0) return false;
+  if (y_stride == 0) y_stride = width;
+  // NV24 is 4:4:4 with interleaved UV for every pixel: 2 bytes per pixel in UV plane.
+  if (uv_stride == 0) uv_stride = width * 2;
+
+  rgb_out.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 3);
+  for (uint32_t y = 0; y < height; y++) {
+    const uint8_t* yrow = y_plane + static_cast<size_t>(y) * y_stride;
+    const uint8_t* uvrow = uv_plane + static_cast<size_t>(y) * uv_stride;
+    for (uint32_t x = 0; x < width; x++) {
+      const uint8_t Y0 = yrow[x];
+      const uint8_t U0 = uvrow[x * 2 + (uv_swap ? 1 : 0)];
+      const uint8_t V0 = uvrow[x * 2 + (uv_swap ? 0 : 1)];
+      uint8_t r, g, b;
+      yuv_to_rgb((int)Y0, (int)U0, (int)V0, r, g, b);
+      size_t oi = (static_cast<size_t>(y) * width + x) * 3;
+      rgb_out[oi + 0] = r;
+      rgb_out[oi + 1] = g;
+      rgb_out[oi + 2] = b;
+    }
+  }
+  return true;
+}
+
+static void fourcc_to_str(uint32_t f, char out[5]) {
+  out[0] = (char)(f & 0xFF);
+  out[1] = (char)((f >> 8) & 0xFF);
+  out[2] = (char)((f >> 16) & 0xFF);
+  out[3] = (char)((f >> 24) & 0xFF);
+  out[4] = '\0';
+}
+
+static void dump_supported_formats(int fd, uint32_t type) {
+  v4l2_fmtdesc d{};
+  d.type = type;
+  for (d.index = 0; d.index < 64; d.index++) {
+    if (ioctl(fd, VIDIOC_ENUM_FMT, &d) < 0) break;
+    char s[5];
+    fourcc_to_str(d.pixelformat, s);
+    std::fprintf(stderr, "[v4l2_capture] ENUM_FMT type=%u idx=%u fourcc=%s (0x%08x)\n",
+                 type, d.index, s, d.pixelformat);
+  }
+}
+
+static inline uint8_t clamp_u8_int(int v) {
+  if (v < 0) return 0;
+  if (v > 255) return 255;
+  return static_cast<uint8_t>(v);
+}
+
+static void yuv_to_rgb(int Y, int U, int V, uint8_t& r, uint8_t& g, uint8_t& b) {
+  // BT.601 limited range conversion (same constants as nv12_to_rgb24)
+  Y -= 16;
+  U -= 128;
+  V -= 128;
+  if (Y < 0) Y = 0;
+  int C = 298 * Y;
+  int rr = (C + 409 * V + 128) >> 8;
+  int gg = (C - 100 * U - 208 * V + 128) >> 8;
+  int bb = (C + 516 * U + 128) >> 8;
+  r = clamp_u8_int(rr);
+  g = clamp_u8_int(gg);
+  b = clamp_u8_int(bb);
+}
+
+static bool yuyv_to_rgb24(const uint8_t* src, uint32_t width, uint32_t height, uint32_t stride, std::vector<uint8_t>& rgb_out) {
+  if (!src || width == 0 || height == 0) return false;
+  if (stride == 0) stride = width * 2;
+  rgb_out.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 3);
+  for (uint32_t y = 0; y < height; y++) {
+    const uint8_t* row = src + static_cast<size_t>(y) * stride;
+    for (uint32_t x = 0; x < width; x += 2) {
+      const uint8_t Y0 = row[x * 2 + 0];
+      const uint8_t U0 = row[x * 2 + 1];
+      const uint8_t Y1 = row[x * 2 + 2];
+      const uint8_t V0 = row[x * 2 + 3];
+      uint8_t r, g, b;
+      size_t oi0 = (static_cast<size_t>(y) * width + x) * 3;
+      yuv_to_rgb((int)Y0, (int)U0, (int)V0, r, g, b);
+      rgb_out[oi0 + 0] = r;
+      rgb_out[oi0 + 1] = g;
+      rgb_out[oi0 + 2] = b;
+      if (x + 1 < width) {
+        size_t oi1 = (static_cast<size_t>(y) * width + (x + 1)) * 3;
+        yuv_to_rgb((int)Y1, (int)U0, (int)V0, r, g, b);
+        rgb_out[oi1 + 0] = r;
+        rgb_out[oi1 + 1] = g;
+        rgb_out[oi1 + 2] = b;
+      }
+    }
+  }
+  return true;
+}
+
+static bool uyvy_to_rgb24(const uint8_t* src, uint32_t width, uint32_t height, uint32_t stride, std::vector<uint8_t>& rgb_out) {
+  if (!src || width == 0 || height == 0) return false;
+  if (stride == 0) stride = width * 2;
+  rgb_out.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 3);
+  for (uint32_t y = 0; y < height; y++) {
+    const uint8_t* row = src + static_cast<size_t>(y) * stride;
+    for (uint32_t x = 0; x < width; x += 2) {
+      const uint8_t U0 = row[x * 2 + 0];
+      const uint8_t Y0 = row[x * 2 + 1];
+      const uint8_t V0 = row[x * 2 + 2];
+      const uint8_t Y1 = row[x * 2 + 3];
+      uint8_t r, g, b;
+      size_t oi0 = (static_cast<size_t>(y) * width + x) * 3;
+      yuv_to_rgb((int)Y0, (int)U0, (int)V0, r, g, b);
+      rgb_out[oi0 + 0] = r;
+      rgb_out[oi0 + 1] = g;
+      rgb_out[oi0 + 2] = b;
+      if (x + 1 < width) {
+        size_t oi1 = (static_cast<size_t>(y) * width + (x + 1)) * 3;
+        yuv_to_rgb((int)Y1, (int)U0, (int)V0, r, g, b);
+        rgb_out[oi1 + 0] = r;
+        rgb_out[oi1 + 1] = g;
+        rgb_out[oi1 + 2] = b;
+      }
+    }
+  }
+  return true;
+}
+
 bool V4L2Capture::open_device(const std::string& devnode) {
   fd_ = ::open(devnode.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
   if (fd_ < 0) return false;
@@ -38,126 +165,238 @@ bool V4L2Capture::configure(uint32_t width, uint32_t height) {
 
   dmabuf_export_supported_ = false;
 
-  v4l2_format fmt{};
-  fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-
-  if (xioctl(fd_, VIDIOC_G_FMT, &fmt) < 0) {
-    std::fprintf(stderr, "[v4l2_capture] VIDIOC_G_FMT failed: %s\n", std::strerror(errno));
-    return false;
-  }
-
-  if (width != 0) fmt.fmt.pix_mp.width = width;
-  if (height != 0) fmt.fmt.pix_mp.height = height;
-
-  auto try_set_fmt = [&](uint32_t pixfmt, uint32_t planes) -> bool {
-    fmt.fmt.pix_mp.pixelformat = pixfmt;
-    fmt.fmt.pix_mp.field = V4L2_FIELD_ANY;
-    fmt.fmt.pix_mp.num_planes = planes;
-    if (xioctl(fd_, VIDIOC_S_FMT, &fmt) < 0) {
+  auto try_configure_type = [&](uint32_t type) -> bool {
+    v4l2_format fmt{};
+    fmt.type = type;
+    if (xioctl(fd_, VIDIOC_G_FMT, &fmt) < 0) {
+      if (debug_) std::fprintf(stderr, "[v4l2_capture] VIDIOC_G_FMT type=%u failed: %s\n", type, std::strerror(errno));
       return false;
     }
+
+    if (debug_) {
+      if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+        char s[5];
+        fourcc_to_str(fmt.fmt.pix_mp.pixelformat, s);
+        std::fprintf(stderr, "[v4l2_capture] G_FMT type=MPLANE %ux%u fourcc=%s (0x%08x) planes=%u\n",
+                     fmt.fmt.pix_mp.width, fmt.fmt.pix_mp.height, s, fmt.fmt.pix_mp.pixelformat, fmt.fmt.pix_mp.num_planes);
+      } else {
+        char s[5];
+        fourcc_to_str(fmt.fmt.pix.pixelformat, s);
+        std::fprintf(stderr, "[v4l2_capture] G_FMT type=CAPTURE %ux%u fourcc=%s (0x%08x)\n",
+                     fmt.fmt.pix.width, fmt.fmt.pix.height, s, fmt.fmt.pix.pixelformat);
+      }
+      dump_supported_formats(fd_, type);
+    }
+
+    // Keep a copy of the driver-selected format so we can fall back to it.
+    const v4l2_format fmt_orig = fmt;
+
+    auto try_set_mplane = [&](uint32_t pixfmt, uint32_t planes) -> bool {
+      fmt.fmt.pix_mp.pixelformat = pixfmt;
+      fmt.fmt.pix_mp.field = V4L2_FIELD_ANY;
+      fmt.fmt.pix_mp.num_planes = planes;
+      if (width != 0) fmt.fmt.pix_mp.width = width;
+      if (height != 0) fmt.fmt.pix_mp.height = height;
+      if (xioctl(fd_, VIDIOC_S_FMT, &fmt) < 0) return false;
+      return true;
+    };
+    auto try_set_single = [&](uint32_t pixfmt) -> bool {
+      fmt.fmt.pix.pixelformat = pixfmt;
+      fmt.fmt.pix.field = V4L2_FIELD_ANY;
+      if (width != 0) fmt.fmt.pix.width = width;
+      if (height != 0) fmt.fmt.pix.height = height;
+      if (xioctl(fd_, VIDIOC_S_FMT, &fmt) < 0) return false;
+      return true;
+    };
+
+    auto try_formats = [&]() -> bool {
+      if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+        errno = 0;
+        if (try_set_mplane(V4L2_PIX_FMT_BGR24, 1)) return true;
+        std::fprintf(stderr, "[v4l2_capture] VIDIOC_S_FMT BGR3 failed: %s\n", std::strerror(errno));
+
+        errno = 0;
+        if (try_set_mplane(V4L2_PIX_FMT_NV12, 2)) return true;
+        std::fprintf(stderr, "[v4l2_capture] VIDIOC_S_FMT NV12 failed: %s\n", std::strerror(errno));
+
+        errno = 0;
+        if (try_set_mplane(V4L2_PIX_FMT_NV12M, 2)) return true;
+        std::fprintf(stderr, "[v4l2_capture] VIDIOC_S_FMT NV12M failed: %s\n", std::strerror(errno));
+
+        errno = 0;
+        if (try_set_mplane(V4L2_PIX_FMT_NV16, 2)) return true;
+        if (debug_) std::fprintf(stderr, "[v4l2_capture] VIDIOC_S_FMT NV16 failed: %s\n", std::strerror(errno));
+
+        errno = 0;
+        if (try_set_mplane(V4L2_PIX_FMT_NV16M, 2)) return true;
+        if (debug_) std::fprintf(stderr, "[v4l2_capture] VIDIOC_S_FMT NV16M failed: %s\n", std::strerror(errno));
+
+        errno = 0;
+        if (try_set_mplane(V4L2_PIX_FMT_YUV420M, 3)) return true;
+        if (debug_) std::fprintf(stderr, "[v4l2_capture] VIDIOC_S_FMT YUV420M failed: %s\n", std::strerror(errno));
+
+        errno = 0;
+        if (try_set_mplane(V4L2_PIX_FMT_YUYV, 1)) return true;
+        std::fprintf(stderr, "[v4l2_capture] VIDIOC_S_FMT YUYV failed: %s\n", std::strerror(errno));
+
+        errno = 0;
+        if (try_set_mplane(V4L2_PIX_FMT_UYVY, 1)) return true;
+        std::fprintf(stderr, "[v4l2_capture] VIDIOC_S_FMT UYVY failed: %s\n", std::strerror(errno));
+
+        return false;
+      }
+
+      // Single-planar
+      errno = 0;
+      if (try_set_single(V4L2_PIX_FMT_BGR24)) return true;
+      if (debug_) std::fprintf(stderr, "[v4l2_capture] VIDIOC_S_FMT(single) BGR3 failed: %s\n", std::strerror(errno));
+
+      errno = 0;
+      if (try_set_single(V4L2_PIX_FMT_NV12)) return true;
+      if (debug_) std::fprintf(stderr, "[v4l2_capture] VIDIOC_S_FMT(single) NV12 failed: %s\n", std::strerror(errno));
+
+      errno = 0;
+      if (try_set_single(V4L2_PIX_FMT_YUYV)) return true;
+      std::fprintf(stderr, "[v4l2_capture] VIDIOC_S_FMT YUYV failed: %s\n", std::strerror(errno));
+
+      errno = 0;
+      if (try_set_single(V4L2_PIX_FMT_UYVY)) return true;
+      std::fprintf(stderr, "[v4l2_capture] VIDIOC_S_FMT UYVY failed: %s\n", std::strerror(errno));
+
+      return false;
+    };
+
+    if (!try_formats()) {
+      // Some HDMI-RX drivers do not allow changing pixel format depending on input mode.
+      // If everything fails, keep the original driver-selected format instead of failing.
+      fmt = fmt_orig;
+      if (debug_) {
+        std::fprintf(stderr, "[v4l2_capture] WARNING: S_FMT failed for all candidates; using driver-selected G_FMT\n");
+      }
+    }
+
+    v4l2_format got{};
+    got.type = type;
+    if (xioctl(fd_, VIDIOC_G_FMT, &got) == 0) fmt = got;
+
+    buf_type_ = type;
+    if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+      width_ = fmt.fmt.pix_mp.width;
+      height_ = fmt.fmt.pix_mp.height;
+      fourcc_ = fmt.fmt.pix_mp.pixelformat;
+      num_planes_ = fmt.fmt.pix_mp.num_planes;
+      if (num_planes_ < 1) return false;
+
+      y_stride_ = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+      uv_stride_ = (num_planes_ >= 2) ? fmt.fmt.pix_mp.plane_fmt[1].bytesperline : 0;
+
+      const uint32_t size0 = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
+      const uint32_t size1 = (num_planes_ >= 2) ? fmt.fmt.pix_mp.plane_fmt[1].sizeimage : 0;
+      const bool is_nv12 = (fourcc_ == V4L2_PIX_FMT_NV12) || (fourcc_ == V4L2_PIX_FMT_NV12M);
+      const bool is_nv24 = (fourcc_ == V4L2_PIX_FMT_NV24);
+      if (is_nv12 && num_planes_ == 1) {
+        if (y_stride_ == 0) y_stride_ = width_;
+        uv_stride_ = y_stride_;
+      } else if (is_nv24 && num_planes_ == 1) {
+        if (y_stride_ == 0) y_stride_ = width_;
+        uv_stride_ = width_ * 2;
+      } else {
+        if (y_stride_ == 0) y_stride_ = width_;
+        if (uv_stride_ == 0) uv_stride_ = y_stride_;
+      }
+      std::fprintf(stderr,
+                   "[v4l2_capture] negotiated: %ux%u fourcc=0x%08x type=MPLANE planes=%u y_stride=%u uv_stride=%u size0=%u size1=%u\n",
+                   width_, height_, fourcc_, num_planes_, y_stride_, uv_stride_, size0, size1);
+    } else {
+      width_ = fmt.fmt.pix.width;
+      height_ = fmt.fmt.pix.height;
+      fourcc_ = fmt.fmt.pix.pixelformat;
+      num_planes_ = 1;
+      y_stride_ = fmt.fmt.pix.bytesperline;
+      uv_stride_ = 0;
+      const uint32_t size0 = fmt.fmt.pix.sizeimage;
+      if (y_stride_ == 0) {
+        // For packed 4:2:2 formats, default stride is width*2.
+        y_stride_ = (fourcc_ == V4L2_PIX_FMT_YUYV || fourcc_ == V4L2_PIX_FMT_UYVY) ? (width_ * 2) : width_;
+      }
+      std::fprintf(stderr,
+                   "[v4l2_capture] negotiated: %ux%u fourcc=0x%08x type=CAPTURE stride=%u size=%u\n",
+                   width_, height_, fourcc_, y_stride_, size0);
+    }
+
+    if ((width != 0 && width_ != width) || (height != 0 && height_ != height)) {
+      std::fprintf(stderr,
+                   "[v4l2_capture] WARNING: requested %ux%u but driver negotiated %ux%u\n",
+                   width, height, width_, height_);
+    }
+
+    v4l2_requestbuffers req{};
+    req.count = reqbuf_count_ < 2 ? 2 : reqbuf_count_;
+    req.type = buf_type_;
+    req.memory = V4L2_MEMORY_MMAP;
+    if (xioctl(fd_, VIDIOC_REQBUFS, &req) < 0) return false;
+    if (req.count < 2) return false;
+
+    buffers_.resize(req.count);
+    for (uint32_t i = 0; i < req.count; i++) {
+      buffers_[i].dmabuf_fd = -1;
+      for (int p = 0; p < 2; p++) {
+        buffers_[i].planes[p].start = nullptr;
+        buffers_[i].planes[p].length = 0;
+      }
+
+      v4l2_buffer buf{};
+      v4l2_plane planes[VIDEO_MAX_PLANES]{};
+      buf.type = buf_type_;
+      buf.memory = V4L2_MEMORY_MMAP;
+      buf.index = i;
+      if (buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+        buf.m.planes = planes;
+        buf.length = num_planes_;
+      }
+      if (xioctl(fd_, VIDIOC_QUERYBUF, &buf) < 0) return false;
+
+      if (buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+        for (uint32_t p = 0; p < buf.length && p < 2; p++) {
+          buffers_[i].planes[p].length = buf.m.planes[p].length;
+          buffers_[i].planes[p].start = mmap(nullptr,
+                                             buf.m.planes[p].length,
+                                             PROT_READ | PROT_WRITE,
+                                             MAP_SHARED,
+                                             fd_,
+                                             buf.m.planes[p].m.mem_offset);
+          if (buffers_[i].planes[p].start == MAP_FAILED) return false;
+        }
+      } else {
+        buffers_[i].planes[0].length = buf.length;
+        buffers_[i].planes[0].start = mmap(nullptr,
+                                           buf.length,
+                                           PROT_READ | PROT_WRITE,
+                                           MAP_SHARED,
+                                           fd_,
+                                           buf.m.offset);
+        if (buffers_[i].planes[0].start == MAP_FAILED) return false;
+      }
+
+      v4l2_exportbuffer exp{};
+      std::memset(&exp, 0, sizeof(exp));
+      exp.type = buf_type_;
+      exp.index = i;
+      exp.plane = 0;
+      exp.flags = O_CLOEXEC;
+      if (xioctl(fd_, VIDIOC_EXPBUF, &exp) == 0) {
+        buffers_[i].dmabuf_fd = exp.fd;
+        dmabuf_export_supported_ = true;
+      }
+    }
+
     return true;
   };
 
-  errno = 0;
-  if (!try_set_fmt(V4L2_PIX_FMT_BGR24, 1)) {
-    int e = errno;
-    std::fprintf(stderr, "[v4l2_capture] VIDIOC_S_FMT BGR3 failed: %s\n", std::strerror(e));
-    if (e == EINVAL) {
-      errno = 0;
-      if (!try_set_fmt(V4L2_PIX_FMT_NV12, 2)) {
-        std::fprintf(stderr, "[v4l2_capture] VIDIOC_S_FMT NV12 failed: %s\n", std::strerror(errno));
-        return false;
-      }
-    } else {
+  // Try MPLANE first (preferred for NV12/NV12M), then fallback to single-planar.
+  if (!try_configure_type(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)) {
+    if (!try_configure_type(V4L2_BUF_TYPE_VIDEO_CAPTURE)) {
       return false;
-    }
-  }
-
-  v4l2_format got{};
-  got.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-  if (xioctl(fd_, VIDIOC_G_FMT, &got) == 0) {
-    fmt = got;
-  }
-
-  width_ = fmt.fmt.pix_mp.width;
-  height_ = fmt.fmt.pix_mp.height;
-  fourcc_ = fmt.fmt.pix_mp.pixelformat;
-
-  if ((width != 0 && width_ != width) || (height != 0 && height_ != height)) {
-    std::fprintf(stderr,
-                 "[v4l2_capture] WARNING: requested %ux%u but driver negotiated %ux%u (HDMI-RX often follows input signal; try setting the source to 1080p or use a scaler/zero-copy path)\n",
-                 width, height, width_, height_);
-  }
-  if (fmt.fmt.pix_mp.num_planes < 1) return false;
-  num_planes_ = fmt.fmt.pix_mp.num_planes;
-
-  y_stride_ = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
-  uv_stride_ = (num_planes_ >= 2) ? fmt.fmt.pix_mp.plane_fmt[1].bytesperline : 0;
-
-  const uint32_t size0 = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
-  const uint32_t size1 = (num_planes_ >= 2) ? fmt.fmt.pix_mp.plane_fmt[1].sizeimage : 0;
-
-  if (fourcc_ == V4L2_PIX_FMT_NV12 && num_planes_ == 1) {
-    if (y_stride_ == 0 && height_ != 0) {
-      const uint64_t denom = static_cast<uint64_t>(height_) * 3ULL;
-      const uint64_t numer = static_cast<uint64_t>(size0) * 2ULL;
-      y_stride_ = (denom != 0) ? static_cast<uint32_t>(numer / denom) : width_;
-    }
-    if (y_stride_ == 0) y_stride_ = width_;
-    uv_stride_ = y_stride_;
-  } else {
-    if (y_stride_ == 0) y_stride_ = width_;
-    if (uv_stride_ == 0) uv_stride_ = y_stride_;
-  }
-
-  std::fprintf(stderr,
-               "[v4l2_capture] negotiated: %ux%u fourcc=0x%08x planes=%u y_stride=%u uv_stride=%u size0=%u size1=%u\n",
-               width_, height_, fourcc_, num_planes_, y_stride_, uv_stride_, size0, size1);
-
-  v4l2_requestbuffers req{};
-  req.count = reqbuf_count_ < 2 ? 2 : reqbuf_count_;
-  req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-  req.memory = V4L2_MEMORY_MMAP;
-
-  if (xioctl(fd_, VIDIOC_REQBUFS, &req) < 0) return false;
-  if (req.count < 2) return false;
-
-  buffers_.resize(req.count);
-
-  for (uint32_t i = 0; i < req.count; i++) {
-    buffers_[i].dmabuf_fd = -1;
-    v4l2_buffer buf{};
-    v4l2_plane planes[VIDEO_MAX_PLANES]{};
-
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    buf.memory = V4L2_MEMORY_MMAP;
-    buf.index = i;
-    buf.m.planes = planes;
-    buf.length = num_planes_;
-
-    if (xioctl(fd_, VIDIOC_QUERYBUF, &buf) < 0) return false;
-
-    for (uint32_t p = 0; p < buf.length && p < 2; p++) {
-      buffers_[i].planes[p].length = buf.m.planes[p].length;
-      buffers_[i].planes[p].start = mmap(nullptr,
-                                         buf.m.planes[p].length,
-                                         PROT_READ | PROT_WRITE,
-                                         MAP_SHARED,
-                                         fd_,
-                                         buf.m.planes[p].m.mem_offset);
-      if (buffers_[i].planes[p].start == MAP_FAILED) return false;
-    }
-
-    v4l2_exportbuffer exp{};
-    std::memset(&exp, 0, sizeof(exp));
-    exp.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    exp.index = i;
-    exp.plane = 0;
-    exp.flags = O_CLOEXEC;
-    if (xioctl(fd_, VIDIOC_EXPBUF, &exp) == 0) {
-      buffers_[i].dmabuf_fd = exp.fd;
-      dmabuf_export_supported_ = true;
     }
   }
 
@@ -181,15 +420,17 @@ bool V4L2Capture::start() {
   for (uint32_t i = 0; i < buffers_.size(); i++) {
     v4l2_buffer buf{};
     v4l2_plane planes[VIDEO_MAX_PLANES]{};
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    buf.type = buf_type_;
     buf.memory = V4L2_MEMORY_MMAP;
     buf.index = i;
-    buf.m.planes = planes;
-    buf.length = num_planes_;
+    if (buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+      buf.m.planes = planes;
+      buf.length = num_planes_;
+    }
     if (xioctl(fd_, VIDIOC_QBUF, &buf) < 0) return false;
   }
 
-  v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+  v4l2_buf_type type = (v4l2_buf_type)buf_type_;
   if (xioctl(fd_, VIDIOC_STREAMON, &type) < 0) return false;
 
   for (int i = 0; i < 12; i++) {
@@ -239,10 +480,12 @@ bool V4L2Capture::acquire_frame(V4L2Frame& out) {
   while (true) {
     v4l2_buffer buf{};
     v4l2_plane planes[VIDEO_MAX_PLANES]{};
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    buf.type = buf_type_;
     buf.memory = V4L2_MEMORY_MMAP;
-    buf.m.planes = planes;
-    buf.length = num_planes_;
+    if (buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+      buf.m.planes = planes;
+      buf.length = num_planes_;
+    }
 
     if (xioctl(fd_, VIDIOC_DQBUF, &buf) < 0) {
       if (errno == EAGAIN) break;
@@ -275,7 +518,10 @@ bool V4L2Capture::acquire_frame(V4L2Frame& out) {
   out.plane1 = nullptr;
   out.data.clear();
 
-  if (fourcc_ == V4L2_PIX_FMT_NV12) {
+  const bool is_nv12 = (fourcc_ == V4L2_PIX_FMT_NV12) || (fourcc_ == V4L2_PIX_FMT_NV12M);
+  const bool is_nv24 = (fourcc_ == V4L2_PIX_FMT_NV24);
+
+  if (is_nv12) {
     const size_t y_size = static_cast<size_t>(y_stride_) * static_cast<size_t>(height_);
     const size_t uv_size = static_cast<size_t>(uv_stride_) * static_cast<size_t>(height_ / 2);
 
@@ -297,6 +543,41 @@ bool V4L2Capture::acquire_frame(V4L2Frame& out) {
       xioctl(fd_, VIDIOC_QBUF, &last);
       return false;
     }
+  } else if (is_nv24) {
+    // NV24 (YUV444): rk_hdmirx provides a single-plane buffer with Y plane followed by full-res interleaved UV.
+    const uint8_t* base = static_cast<const uint8_t*>(buffers_[last.index].planes[0].start);
+    const size_t avail = buffers_[last.index].planes[0].length;
+    if (y_stride_ == 0) y_stride_ = width_;
+    if (uv_stride_ == 0) uv_stride_ = width_ * 2;
+    const size_t y_size = static_cast<size_t>(y_stride_) * static_cast<size_t>(height_);
+    const size_t uv_size = static_cast<size_t>(uv_stride_) * static_cast<size_t>(height_);
+    if (avail < (y_size + uv_size)) {
+      std::fprintf(stderr, "[v4l2_capture] NV24 buffer too small: have=%zu need=%zu\n", avail, (y_size + uv_size));
+      xioctl(fd_, VIDIOC_QBUF, &last);
+      return false;
+    }
+    out.plane0 = base;
+    out.plane1 = base + y_size;
+  } else if (fourcc_ == V4L2_PIX_FMT_YUYV && num_planes_ >= 1) {
+    const uint8_t* src = static_cast<const uint8_t*>(buffers_[last.index].planes[0].start);
+    if (!yuyv_to_rgb24(src, width_, height_, y_stride_, out.data)) {
+      xioctl(fd_, VIDIOC_QBUF, &last);
+      return false;
+    }
+    out.needs_release = false;
+    out.plane0 = nullptr;
+    out.plane1 = nullptr;
+    if (xioctl(fd_, VIDIOC_QBUF, &last) < 0) return false;
+  } else if (fourcc_ == V4L2_PIX_FMT_UYVY && num_planes_ >= 1) {
+    const uint8_t* src = static_cast<const uint8_t*>(buffers_[last.index].planes[0].start);
+    if (!uyvy_to_rgb24(src, width_, height_, y_stride_, out.data)) {
+      xioctl(fd_, VIDIOC_QBUF, &last);
+      return false;
+    }
+    out.needs_release = false;
+    out.plane0 = nullptr;
+    out.plane1 = nullptr;
+    if (xioctl(fd_, VIDIOC_QBUF, &last) < 0) return false;
   } else if (fourcc_ == V4L2_PIX_FMT_BGR24 && num_planes_ >= 1) {
     const uint8_t* src = static_cast<const uint8_t*>(buffers_[last.index].planes[0].start);
     if (!bgr24_to_rgb24(src, width_, height_, out.data)) {
@@ -320,11 +601,13 @@ bool V4L2Capture::release_frame(V4L2Frame& frame) {
   if (!frame.needs_release) return true;
   v4l2_buffer buf{};
   v4l2_plane planes[VIDEO_MAX_PLANES]{};
-  buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+  buf.type = buf_type_;
   buf.memory = V4L2_MEMORY_MMAP;
   buf.index = frame.index;
-  buf.m.planes = planes;
-  buf.length = num_planes_;
+  if (buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+    buf.m.planes = planes;
+    buf.length = num_planes_;
+  }
   if (xioctl(fd_, VIDIOC_QBUF, &buf) < 0) return false;
   frame.needs_release = false;
   return true;
@@ -332,7 +615,7 @@ bool V4L2Capture::release_frame(V4L2Frame& frame) {
 
 void V4L2Capture::stop() {
   if (fd_ < 0) return;
-  v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+  v4l2_buf_type type = (v4l2_buf_type)buf_type_;
   xioctl(fd_, VIDIOC_STREAMOFF, &type);
 }
 

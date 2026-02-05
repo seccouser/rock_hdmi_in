@@ -15,6 +15,8 @@
 #include <cctype>
 #include <unordered_map>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <pwd.h>
 #include <csignal>
 #include <time.h>
  #include <EGL/eglext.h>
@@ -95,6 +97,7 @@ int main(int argc, char** argv) {
 
   std::string video_dev = "/dev/video0";
   std::string drm_dev = "/dev/dri/card0";
+  std::string mode_override;
   uint32_t cap_w = 0;
   uint32_t cap_h = 0;
 
@@ -128,6 +131,7 @@ int main(int argc, char** argv) {
   int sub_left = 1;
   int sub_mstart = 0;
   int sub_hq = 0;
+  int sub_atlas_flip_y = 0;
   bool sub_left_overridden = false;
 
   auto trim_in_place = [](std::string& s) {
@@ -139,9 +143,97 @@ int main(int argc, char** argv) {
   };
 
   auto default_config_path = [&]() -> std::string {
-    const char* home = std::getenv("HOME");
-    if (!home || !home[0]) return std::string();
-    return std::string(home) + "/.config/3dplayer.conf";
+    auto config_home_dir = [&]() -> std::string {
+      const char* sudo_user = std::getenv("SUDO_USER");
+      if (sudo_user && sudo_user[0]) {
+        struct passwd* pw = getpwnam(sudo_user);
+        if (pw && pw->pw_dir && pw->pw_dir[0]) return std::string(pw->pw_dir);
+      }
+      const char* home = std::getenv("HOME");
+      if (home && home[0]) return std::string(home);
+      return std::string();
+    };
+
+    const std::string home = config_home_dir();
+    if (home.empty()) return std::string();
+    const std::string p_new = home + "/.config/3dglobal/3dplayer.conf";
+    {
+      std::ifstream f(p_new);
+      if (f.is_open()) return p_new;
+    }
+    const std::string p_old = home + "/.config/3dplayer.conf";
+    {
+      std::ifstream f(p_old);
+      if (f.is_open()) return p_old;
+    }
+    // Default to the new location if neither exists yet.
+    return p_new;
+  };
+
+  auto ensure_default_config_exists = [&]() {
+    auto config_home_dir = [&]() -> std::string {
+      const char* sudo_user = std::getenv("SUDO_USER");
+      if (sudo_user && sudo_user[0]) {
+        struct passwd* pw = getpwnam(sudo_user);
+        if (pw && pw->pw_dir && pw->pw_dir[0]) return std::string(pw->pw_dir);
+      }
+      const char* home = std::getenv("HOME");
+      if (home && home[0]) return std::string(home);
+      return std::string();
+    };
+
+    const std::string home = config_home_dir();
+    if (home.empty()) return;
+
+    const std::string p_new = home + "/.config/3dglobal/3dplayer.conf";
+    {
+      std::ifstream f(p_new);
+      if (f.is_open()) return;
+    }
+    const std::string p_old = home + "/.config/3dplayer.conf";
+    {
+      std::ifstream f(p_old);
+      if (f.is_open()) return;
+    }
+
+    const std::string d_cfg = home + "/.config";
+    const std::string d_new = home + "/.config/3dglobal";
+    if (::mkdir(d_cfg.c_str(), 0755) != 0 && errno != EEXIST) return;
+    if (::mkdir(d_new.c_str(), 0755) != 0 && errno != EEXIST) return;
+
+    std::ofstream out(p_new);
+    if (!out.is_open()) return;
+
+    out << "# Global defaults for rock5b_hdmiin_gl / 3dplayer\n";
+    out << "# Keys mirror profile files (key=value). Profiles/CLI can override these.\n\n";
+    out << "# Enable subpixel postpass mosaic by default\n";
+    out << "subpixel=1\n\n";
+    out << "# Default atlas / mosaic parameters\n";
+    out << "mx=4\n";
+    out << "my=4\n";
+    out << "views=5\n";
+    out << "wz=4\n";
+    out << "wn=5\n";
+    out << "left=1\n";
+    out << "mstart=0\n";
+    out << "hq=0\n\n";
+    out << "test=0\n\n";
+    out << "# Texture / orientation controls\n";
+    out << "flip_y=0\n";
+    out << "atlas_flip_y=1\n\n";
+    out << "# Optional pipeline toggles (0/1)\n";
+    out << "# nv21=0\n";
+    out << "# dmabuf_uv_ra=0\n\n";
+    out << "# Optional shader path override\n";
+    out << "# By default, shader_dir is auto-detected as <exe_dir>/../shaders\n";
+    out << "# shader_dir=/path/to/shaders\n\n";
+    out << "# Optional V4L2 capture buffers (VIDIOC_REQBUFS)\n";
+    out << "# buffers=4\n\n";
+    out << "# Optional devices (uncomment to pin)\n";
+    out << "# video_dev=/dev/video0\n";
+    out << "# drm_dev=/dev/dri/card0\n\n";
+    out << "# Optional DRM mode override (examples: 1920x1080 or 1920x1080@60)\n";
+    out << "# mode=1920x1080@60\n";
   };
 
   auto load_config_file = [&](const std::string& path) -> bool {
@@ -158,6 +250,7 @@ int main(int argc, char** argv) {
         {"left", &sub_left},
         {"mstart", &sub_mstart},
         {"hq", &sub_hq},
+        {"atlas_flip_y", &sub_atlas_flip_y},
     };
     std::unordered_map<std::string, bool*> mb{
         {"flip_y", &flip_y},
@@ -186,6 +279,10 @@ int main(int argc, char** argv) {
         drm_dev = val;
         continue;
       }
+      if (key == "mode") {
+        mode_override = val;
+        continue;
+      }
       if (key == "shader_dir") {
         shader_dir = val;
         continue;
@@ -204,6 +301,7 @@ int main(int argc, char** argv) {
       auto iti = mi.find(key);
       if (iti != mi.end()) {
         *(iti->second) = std::atoi(val.c_str());
+        if (key == "left") sub_left_overridden = true;
         continue;
       }
     }
@@ -223,6 +321,7 @@ int main(int argc, char** argv) {
         {"left", &sub_left},
         {"mstart", &sub_mstart},
         {"hq", &sub_hq},
+        {"atlas_flip_y", &sub_atlas_flip_y},
     };
     std::unordered_map<std::string, bool*> mb{
         {"flip_y", &flip_y},
@@ -250,6 +349,7 @@ int main(int argc, char** argv) {
       auto it = m.find(key);
       if (it == m.end()) continue;
       *(it->second) = std::atoi(val.c_str());
+      if (key == "left") sub_left_overridden = true;
     }
     return true;
   };
@@ -278,11 +378,16 @@ int main(int argc, char** argv) {
       config_file = argv[++i];
     } else if (a == "--no-config") {
       use_config = false;
+    } else if (a == "--mode" && (i + 1) < argc) {
+      mode_override = argv[++i];
     }
   }
 
   if (use_config) {
-    if (config_file.empty()) config_file = default_config_path();
+    if (config_file.empty()) {
+      ensure_default_config_exists();
+      config_file = default_config_path();
+    }
     if (!config_file.empty()) {
       (void)load_config_file(config_file);
     }
@@ -312,6 +417,15 @@ int main(int argc, char** argv) {
     }
   }
 
+  if (debug) {
+    std::fprintf(stderr,
+                 "[rock5b_hdmiin_gl] subpixel params: enable_subpixel=%d mx=%d my=%d views=%d wz=%d wn=%d test=%d left=%d mstart=%d hq=%d flip_y=%d\n",
+                 enable_subpixel ? 1 : 0,
+                 sub_mx, sub_my, sub_views, sub_wz, sub_wn,
+                 sub_test, sub_left, sub_mstart, sub_hq,
+                 flip_y ? 1 : 0);
+  }
+
   for (int i = arg_start; i < argc; i++) {
     if (std::string(argv[i]) == "--nv21") {
       nv21 = true;
@@ -321,6 +435,8 @@ int main(int argc, char** argv) {
       video_dev = argv[++i];
     } else if (std::string(argv[i]) == "--drm" && (i + 1) < argc) {
       drm_dev = argv[++i];
+    } else if (std::string(argv[i]) == "--mode" && (i + 1) < argc) {
+      mode_override = argv[++i];
     } else if (std::string(argv[i]) == "--shader-dir" && (i + 1) < argc) {
       shader_dir = argv[++i];
     } else if (std::string(argv[i]) == "--profile" && (i + 1) < argc) {
@@ -364,6 +480,8 @@ int main(int argc, char** argv) {
       sub_mstart = std::atoi(argv[++i]);
     } else if (std::string(argv[i]) == "--hq" && (i + 1) < argc) {
       sub_hq = std::atoi(argv[++i]);
+    } else if (std::string(argv[i]) == "--atlas-flip-y" && (i + 1) < argc) {
+      sub_atlas_flip_y = std::atoi(argv[++i]);
     } else if (std::string(argv[i]) == "--buffers" && (i + 1) < argc) {
       buffers = (uint32_t)std::strtoul(argv[++i], nullptr, 10);
     } else if (std::string(argv[i]) == "--w" && (i + 1) < argc) {
@@ -376,7 +494,8 @@ int main(int argc, char** argv) {
   GbmEglDrm gfx{};
   gfx.debug = debug;
   std::fprintf(stderr, "[rock5b_hdmiin_gl] init DRM/GBM/EGL on %s\n", drm_dev.c_str());
-  if (!init_drm_gbm_egl(gfx, drm_dev.c_str())) {
+  const char* mode_override_c = mode_override.empty() ? nullptr : mode_override.c_str();
+  if (!init_drm_gbm_egl(gfx, drm_dev.c_str(), mode_override_c)) {
     std::fprintf(stderr, "[rock5b_hdmiin_gl] init_drm_gbm_egl failed\n");
     return 1;
   }
@@ -412,9 +531,11 @@ int main(int argc, char** argv) {
     return 4;
   }
 
-  bool use_nv12 = (cap.fourcc() == 0x3231564e);
+  bool use_nv12 = (cap.fourcc() == 0x3231564e) || (cap.fourcc() == 0x32314d4e);
+  bool use_nv24 = (cap.fourcc() == 0x3432564e);
+  bool use_yuv = use_nv12 || use_nv24;
   bool use_zero_copy = false;
-  if (use_nv12 && egl_has_dmabuf_import && cap.dmabuf_export_supported()) {
+  if (use_yuv && egl_has_dmabuf_import && cap.dmabuf_export_supported()) {
     use_zero_copy = true;
     if (debug) std::fprintf(stderr, "[rock5b_hdmiin_gl] zero-copy path enabled (DMABUF + EGLImage)\n");
   }
@@ -429,6 +550,8 @@ int main(int argc, char** argv) {
   if (fs_file.empty()) {
     if (use_nv12) {
       fs_file = use_zero_copy ? "nv12_dmabuf.fs.glsl" : "nv12.fs.glsl";
+    } else if (use_nv24) {
+      fs_file = use_zero_copy ? "nv24_dmabuf.fs.glsl" : "nv24.fs.glsl";
     } else {
       fs_file = "blit.fs.glsl";
     }
@@ -452,6 +575,18 @@ int main(int argc, char** argv) {
     // When flipping v_uv in the post-pass, we must flip the raster indexing as well,
     // otherwise channel selection will be misaligned and colors will be wrong.
     sub_left = 0;
+  }
+
+  if (debug) {
+    std::fprintf(stderr,
+                 "[rock5b_hdmiin_gl] shader selection: two_pass=%d pre(vs=%s fs=%s) post(vs=%s fs=%s)\n",
+                 (!post_fs_file.empty()) ? 1 : 0,
+                 vs_file.c_str(), fs_file.c_str(),
+                 post_vs_file.c_str(), post_fs_file.c_str());
+    std::fprintf(stderr,
+                 "[rock5b_hdmiin_gl] postpass subpixel params (final): mx=%d my=%d views=%d wz=%d wn=%d test=%d left=%d mstart=%d hq=%d\n",
+                 sub_mx, sub_my, sub_views, sub_wz, sub_wn,
+                 sub_test, sub_left, sub_mstart, sub_hq);
   }
 
   const bool two_pass = !post_fs_file.empty();
@@ -482,7 +617,9 @@ int main(int argc, char** argv) {
       return 6;
     }
   } else {
-    prog_pre = load_and_build_program("fullscreen.vs.glsl", use_nv12 ? (use_zero_copy ? "nv12_dmabuf.fs.glsl" : "nv12.fs.glsl") : "blit.fs.glsl");
+    prog_pre = load_and_build_program("fullscreen.vs.glsl",
+                                      use_nv12 ? (use_zero_copy ? "nv12_dmabuf.fs.glsl" : "nv12.fs.glsl") :
+                                      (use_nv24 ? (use_zero_copy ? "nv24_dmabuf.fs.glsl" : "nv24.fs.glsl") : "blit.fs.glsl"));
     prog_post = load_and_build_program(post_vs_file, post_fs_file);
     if (!prog_pre || !prog_post) {
       std::fprintf(stderr, "[rock5b_hdmiin_gl] program link failed\n");
@@ -499,6 +636,7 @@ int main(int argc, char** argv) {
   GLint post_loc_left = -1;
   GLint post_loc_mstart = -1;
   GLint post_loc_hq = -1;
+  GLint post_loc_atlas_flip_y = -1;
   GLint post_loc_res = -1;
   if (two_pass) {
     post_loc_mx = glGetUniformLocation(prog_post, "mx");
@@ -510,7 +648,15 @@ int main(int argc, char** argv) {
     post_loc_left = glGetUniformLocation(prog_post, "left");
     post_loc_mstart = glGetUniformLocation(prog_post, "mstart");
     post_loc_hq = glGetUniformLocation(prog_post, "hq");
+    post_loc_atlas_flip_y = glGetUniformLocation(prog_post, "atlas_flip_y");
     post_loc_res = glGetUniformLocation(prog_post, "u_resolution");
+
+    if (debug) {
+      std::fprintf(stderr,
+                   "[rock5b_hdmiin_gl] postpass uniform locations: mx=%d my=%d views=%d wz=%d wn=%d test=%d left=%d mstart=%d hq=%d res=%d\n",
+                   post_loc_mx, post_loc_my, post_loc_views, post_loc_wz, post_loc_wn,
+                   post_loc_test, post_loc_left, post_loc_mstart, post_loc_hq, post_loc_res);
+    }
 
     glUseProgram(prog_post);
     if (post_loc_mx >= 0) glUniform1i(post_loc_mx, sub_mx);
@@ -522,16 +668,24 @@ int main(int argc, char** argv) {
     if (post_loc_left >= 0) glUniform1i(post_loc_left, sub_left);
     if (post_loc_mstart >= 0) glUniform1i(post_loc_mstart, sub_mstart);
     if (post_loc_hq >= 0) glUniform1i(post_loc_hq, sub_hq);
+    if (post_loc_atlas_flip_y >= 0) glUniform1i(post_loc_atlas_flip_y, sub_atlas_flip_y);
     if (post_loc_res >= 0) glUniform2i(post_loc_res, (int)gfx.mode_hdisplay, (int)gfx.mode_vdisplay);
+
+    if (debug) {
+      GLenum e = glGetError();
+      if (e) {
+        std::fprintf(stderr, "[rock5b_hdmiin_gl] postpass uniform upload glGetError=0x%x\n", (unsigned)e);
+      }
+    }
   }
 
   GLint a_pos_pre = glGetAttribLocation(prog_pre, "a_pos");
   GLint a_uv_pre = glGetAttribLocation(prog_pre, "a_uv");
-  GLint u_tex_pre = use_nv12 ? -1 : glGetUniformLocation(prog_pre, "u_tex");
-  GLint u_tex_y_pre = use_nv12 ? glGetUniformLocation(prog_pre, "u_tex_y") : -1;
-  GLint u_tex_uv_pre = use_nv12 ? glGetUniformLocation(prog_pre, "u_tex_uv") : -1;
-  GLint u_uvSwap_pre = use_nv12 ? glGetUniformLocation(prog_pre, "u_uvSwap") : -1;
-  GLint u_uvRA_pre = use_nv12 ? glGetUniformLocation(prog_pre, "u_uvRA") : -1;
+  GLint u_tex_pre = use_yuv ? -1 : glGetUniformLocation(prog_pre, "u_tex");
+  GLint u_tex_y_pre = use_yuv ? glGetUniformLocation(prog_pre, "u_tex_y") : -1;
+  GLint u_tex_uv_pre = use_yuv ? glGetUniformLocation(prog_pre, "u_tex_uv") : -1;
+  GLint u_uvSwap_pre = use_yuv ? glGetUniformLocation(prog_pre, "u_uvSwap") : -1;
+  GLint u_uvRA_pre = use_zero_copy ? glGetUniformLocation(prog_pre, "u_uvRA") : -1;
 
   GLint a_pos_post = -1;
   GLint a_uv_post = -1;
@@ -565,7 +719,7 @@ int main(int argc, char** argv) {
   std::vector<GLuint> y_texs;
   std::vector<GLuint> uv_texs;
 
-  if (!use_nv12) {
+  if (!use_yuv) {
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -800,7 +954,7 @@ int main(int argc, char** argv) {
       }
     }
 
-    if (!frame.needs_release && frame.data.empty() && !use_nv12) {
+    if (!frame.needs_release && frame.data.empty() && !use_yuv) {
       if (!drm_gbm_egl_swap_buffers(gfx)) {
         std::fprintf(stderr, "[rock5b_hdmiin_gl] swap_buffers failed\n");
         break;
@@ -808,7 +962,7 @@ int main(int argc, char** argv) {
       continue;
     }
 
-    if (use_nv12) {
+    if (use_yuv) {
       if (!frame.needs_release) {
         if (!drm_gbm_egl_swap_buffers(gfx)) {
           std::fprintf(stderr, "[rock5b_hdmiin_gl] swap_buffers failed\n");
@@ -832,12 +986,18 @@ int main(int argc, char** argv) {
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, tex_uv);
         if (!tex_alloc || tex_w != frame.width || tex_h != frame.height) {
-          glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, (GLsizei)(frame.width / 2), (GLsizei)(frame.height / 2), 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, nullptr);
+          const GLsizei uv_w = (GLsizei)(use_nv24 ? frame.width : (frame.width / 2));
+          const GLsizei uv_h = (GLsizei)(use_nv24 ? frame.height : (frame.height / 2));
+          glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, uv_w, uv_h, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, nullptr);
           tex_alloc = true;
           tex_w = frame.width;
           tex_h = frame.height;
         }
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)(frame.width / 2), (GLsizei)(frame.height / 2), GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, frame.plane1);
+        {
+          const GLsizei uv_w = (GLsizei)(use_nv24 ? frame.width : (frame.width / 2));
+          const GLsizei uv_h = (GLsizei)(use_nv24 ? frame.height : (frame.height / 2));
+          glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_w, uv_h, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, frame.plane1);
+        }
       } else {
         if (y_images.empty()) {
           const size_t nbuf = (size_t)cap.buffer_count();
@@ -856,8 +1016,8 @@ int main(int argc, char** argv) {
 
             const int y_w = (int)cap.width();
             const int y_h = (int)cap.height();
-            const int uv_w = y_w / 2;
-            const int uv_h = y_h / 2;
+            const int uv_w = use_nv24 ? y_w : (y_w / 2);
+            const int uv_h = use_nv24 ? y_h : (y_h / 2);
             const int y_pitch = (int)frame.y_stride;
             const int uv_pitch = (int)frame.uv_stride;
             const int y_offset = 0;
@@ -938,7 +1098,7 @@ int main(int argc, char** argv) {
       glClear(GL_COLOR_BUFFER_BIT);
 
       glUseProgram(prog_pre);
-      if (use_nv12) {
+      if (use_yuv) {
         glActiveTexture(GL_TEXTURE0);
         glActiveTexture(GL_TEXTURE1);
         glUniform1i(u_tex_y_pre, 0);
@@ -957,8 +1117,8 @@ int main(int argc, char** argv) {
 
       glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     } else {
-      const uint32_t src_w = use_nv12 ? frame.width : tex_w;
-      const uint32_t src_h = use_nv12 ? frame.height : tex_h;
+      const uint32_t src_w = use_yuv ? frame.width : tex_w;
+      const uint32_t src_h = use_yuv ? frame.height : tex_h;
 
       if (!fbo_alloc || fbo_w != src_w || fbo_h != src_h) {
         if (fbo == 0) glGenFramebuffers(1, &fbo);
@@ -991,7 +1151,7 @@ int main(int argc, char** argv) {
 
       glUseProgram(prog_pre);
 
-      if (use_nv12) {
+      if (use_yuv) {
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, cur_y_tex);
         glActiveTexture(GL_TEXTURE1);
@@ -1036,6 +1196,7 @@ int main(int argc, char** argv) {
       if (post_loc_left >= 0) glUniform1i(post_loc_left, sub_left);
       if (post_loc_mstart >= 0) glUniform1i(post_loc_mstart, sub_mstart);
       if (post_loc_hq >= 0) glUniform1i(post_loc_hq, sub_hq);
+      if (post_loc_atlas_flip_y >= 0) glUniform1i(post_loc_atlas_flip_y, sub_atlas_flip_y);
       if (post_loc_res >= 0) glUniform2i(post_loc_res, (int)gfx.mode_hdisplay, (int)gfx.mode_vdisplay);
 
       glEnableVertexAttribArray((GLuint)a_pos_post);

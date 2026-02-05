@@ -44,7 +44,7 @@ struct GbmEglDrm {
 
 };
 
-bool init_drm_gbm_egl(GbmEglDrm& ctx, const char* drm_node);
+bool init_drm_gbm_egl(GbmEglDrm& ctx, const char* drm_node, const char* mode_override);
 bool drm_gbm_egl_make_current(GbmEglDrm& ctx);
 bool drm_gbm_egl_swap_buffers(GbmEglDrm& ctx);
 void destroy_drm_gbm_egl(GbmEglDrm& ctx);

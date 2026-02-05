@@ -3,7 +3,7 @@
 atlas_flip_y=1
 flip_y=0
 subpixel=1
-mx=3
+mx=2
 my=3
 views=5
 wz=4

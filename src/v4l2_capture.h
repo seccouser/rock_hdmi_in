@@ -46,6 +46,7 @@ public:
 
 private:
   int fd_ = -1;
+  uint32_t buf_type_ = 0;
   uint32_t width_ = 0;
   uint32_t height_ = 0;
   uint32_t fourcc_ = 0;
@@ -76,3 +77,4 @@ private:
 
 bool bgr24_to_rgb24(const uint8_t* bgr, uint32_t width, uint32_t height, std::vector<uint8_t>& rgb_out);
 bool nv12_to_rgb24(const uint8_t* y_plane, const uint8_t* uv_plane, uint32_t width, uint32_t height, uint32_t y_stride, uint32_t uv_stride, bool uv_swap, std::vector<uint8_t>& rgb_out);
+bool nv24_to_rgb24(const uint8_t* y_plane, const uint8_t* uv_plane, uint32_t width, uint32_t height, uint32_t y_stride, uint32_t uv_stride, bool uv_swap, std::vector<uint8_t>& rgb_out);
