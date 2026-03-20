@@ -16,7 +16,7 @@ This project is intended to run **fullscreen on the DRM/KMS display** (no X11/Wa
 - Zero-copy NV12 path using dmabuf/EGLImage (when supported)
 - Shader files are external in `./shaders/`
 - Profiles in `./shaders/profiles/*.profile`
-- Optional global config file: `~/.config/3dplayer.conf`
+- Optional global config file: `~/.config/3dglobal/3dplayer.conf` (legacy `~/.config/3dplayer.conf` is still supported)
 
 ## Build prerequisites
 
@@ -66,6 +66,59 @@ sudo ./build/rock5b_hdmiin_gl /dev/video0
 sudo ./build/rock5b_hdmiin_gl /dev/video0 --profile Profile_4x4
 ```
 
+Profile shorthand (compatibility):
+
+```bash
+sudo ./build/rock5b_hdmiin_gl /dev/video0 --Profile_4x4
+```
+
+## Tracking (`track`)
+
+The post-processing mosaic shader supports two offsets:
+
+- `mstart`: static offset
+- `track`: dynamic offset (intended for runtime tracking)
+
+Both offsets are applied in the same place in the shader.
+
+Notes about loop length:
+
+- With `hq=0`, the tracking offset loops after `views` steps.
+- With `hq=3`, the tracking offset loops after `views * wn` steps.
+
+Set the value via:
+
+- config/profile: `track=<int>`
+- CLI: `--track <int>`
+
+### Runtime control (testing)
+
+Signals:
+
+- `SIGUSR1`: `track += 1`
+- `SIGUSR2`: `track -= 1`
+
+Example:
+
+```bash
+pidof rock5b_hdmiin_gl
+kill -USR1 <pid>
+kill -USR2 <pid>
+```
+
+Keyboard (requires a TTY):
+
+```bash
+sudo ./build/rock5b_hdmiin_gl /dev/video0 --track-keys
+```
+
+Keys:
+
+- left/right: `track +/- 1`
+- up/down: `track +/- 10`
+- `r`: reset (`track=0`)
+- `q`: quit
+
 ### Run without positional video device
 
 If you set `video_dev` in the global config (see below), you can run:
@@ -114,6 +167,10 @@ sudo ./build/rock5b_hdmiin_gl /dev/video0 --debug
 
 Default path:
 
+- `~/.config/3dglobal/3dplayer.conf`
+
+Legacy path (still supported):
+
 - `~/.config/3dplayer.conf`
 
 Format:
@@ -139,6 +196,18 @@ flip_y=0
 subpixel=0
 nv21=0
 dmabuf_uv_ra=0
+
+# Default subpixel params
+mx=4
+my=4
+views=5
+wz=4
+wn=5
+left=1
+mstart=0
+track=0
+hq=0
+test=0
 ```
 
 Override config file:
@@ -161,7 +230,7 @@ Profiles live in:
 
 Example keys:
 
-- Subpixel params: `mx`, `my`, `views`, `wz`, `wn`, `left`, `mstart`, `hq`, `test`
+- Subpixel params: `mx`, `my`, `views`, `wz`, `wn`, `left`, `mstart`, `track`, `hq`, `test`
 - Boolean options: `flip_y`, `nv21`, `dmabuf_uv_ra`, `subpixel`
 
 Example profile:
@@ -177,6 +246,7 @@ wz=4
 wn=5
 left=1
 mstart=0
+track=0
 hq=0
 test=0
 ```

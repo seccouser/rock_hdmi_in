@@ -19,11 +19,14 @@
 #include <pwd.h>
 #include <csignal>
 #include <time.h>
+#include <termios.h>
+#include <fcntl.h>
  #include <EGL/eglext.h>
  #include <drm_fourcc.h>
 
 static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_sigint_count = 0;
+static volatile sig_atomic_t g_track_delta = 0;
 
 static void on_sigalrm(int) {
   std::_Exit(130);
@@ -37,6 +40,14 @@ static void on_sigint(int) {
   }
 
   alarm(1);
+}
+
+static void on_sigusr1(int) {
+  g_track_delta++;
+}
+
+static void on_sigusr2(int) {
+  g_track_delta--;
 }
 
 static std::string read_text_file(const std::string& path) {
@@ -95,6 +106,24 @@ int main(int argc, char** argv) {
     sigaction(SIGALRM, &sa, nullptr);
   }
 
+  {
+    struct sigaction sa;
+    std::memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_sigusr1;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGUSR1, &sa, nullptr);
+  }
+
+  {
+    struct sigaction sa;
+    std::memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_sigusr2;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGUSR2, &sa, nullptr);
+  }
+
   std::string video_dev = "/dev/video0";
   std::string drm_dev = "/dev/dri/card0";
   std::string mode_override;
@@ -120,6 +149,7 @@ int main(int argc, char** argv) {
   bool flip_y = false;
   bool dmabuf_uv_ra = false;
   bool enable_subpixel = false;
+  bool track_keys = false;
   uint32_t buffers = 4;
 
   int sub_mx = 4;
@@ -130,6 +160,7 @@ int main(int argc, char** argv) {
   int sub_test = 0;
   int sub_left = 1;
   int sub_mstart = 0;
+  int sub_track = 0;
   int sub_hq = 0;
   int sub_atlas_flip_y = 0;
   bool sub_left_overridden = false;
@@ -216,6 +247,7 @@ int main(int argc, char** argv) {
     out << "wn=5\n";
     out << "left=1\n";
     out << "mstart=0\n";
+    out << "track=0\n";
     out << "hq=0\n\n";
     out << "test=0\n\n";
     out << "# Texture / orientation controls\n";
@@ -249,6 +281,7 @@ int main(int argc, char** argv) {
         {"test", &sub_test},
         {"left", &sub_left},
         {"mstart", &sub_mstart},
+        {"track", &sub_track},
         {"hq", &sub_hq},
         {"atlas_flip_y", &sub_atlas_flip_y},
     };
@@ -320,6 +353,7 @@ int main(int argc, char** argv) {
         {"test", &sub_test},
         {"left", &sub_left},
         {"mstart", &sub_mstart},
+        {"track", &sub_track},
         {"hq", &sub_hq},
         {"atlas_flip_y", &sub_atlas_flip_y},
     };
@@ -401,6 +435,10 @@ int main(int argc, char** argv) {
       profile_name = argv[++i];
     } else if (a == "--profile-file" && (i + 1) < argc) {
       profile_file = argv[++i];
+    } else if (a.rfind("--Profile_", 0) == 0 || a.rfind("--profile_", 0) == 0) {
+      // Compatibility shorthand: allow passing the profile name directly as an option.
+      // Example: --Profile_3x3  (equivalent to: --profile Profile_3x3)
+      profile_name = a.substr(2);
     }
   }
 
@@ -417,12 +455,28 @@ int main(int argc, char** argv) {
     }
   }
 
+  auto wrap_track_in_place = [&]() {
+    int maxv = sub_views;
+    if (sub_hq == 3) {
+      maxv = sub_views * sub_wn;
+    }
+    if (maxv <= 0) {
+      sub_track = 0;
+      return;
+    }
+    int t = sub_track % maxv;
+    if (t < 0) t += maxv;
+    sub_track = t;
+  };
+
+  wrap_track_in_place();
+
   if (debug) {
     std::fprintf(stderr,
-                 "[rock5b_hdmiin_gl] subpixel params: enable_subpixel=%d mx=%d my=%d views=%d wz=%d wn=%d test=%d left=%d mstart=%d hq=%d flip_y=%d\n",
+                 "[rock5b_hdmiin_gl] subpixel params: enable_subpixel=%d mx=%d my=%d views=%d wz=%d wn=%d test=%d left=%d mstart=%d track=%d hq=%d flip_y=%d\n",
                  enable_subpixel ? 1 : 0,
                  sub_mx, sub_my, sub_views, sub_wz, sub_wn,
-                 sub_test, sub_left, sub_mstart, sub_hq,
+                 sub_test, sub_left, sub_mstart, sub_track, sub_hq,
                  flip_y ? 1 : 0);
   }
 
@@ -478,6 +532,10 @@ int main(int argc, char** argv) {
       sub_left_overridden = true;
     } else if (std::string(argv[i]) == "--mstart" && (i + 1) < argc) {
       sub_mstart = std::atoi(argv[++i]);
+    } else if (std::string(argv[i]) == "--track" && (i + 1) < argc) {
+      sub_track = std::atoi(argv[++i]);
+    } else if (std::string(argv[i]) == "--track-keys") {
+      track_keys = true;
     } else if (std::string(argv[i]) == "--hq" && (i + 1) < argc) {
       sub_hq = std::atoi(argv[++i]);
     } else if (std::string(argv[i]) == "--atlas-flip-y" && (i + 1) < argc) {
@@ -584,9 +642,9 @@ int main(int argc, char** argv) {
                  vs_file.c_str(), fs_file.c_str(),
                  post_vs_file.c_str(), post_fs_file.c_str());
     std::fprintf(stderr,
-                 "[rock5b_hdmiin_gl] postpass subpixel params (final): mx=%d my=%d views=%d wz=%d wn=%d test=%d left=%d mstart=%d hq=%d\n",
+                 "[rock5b_hdmiin_gl] postpass subpixel params (final): mx=%d my=%d views=%d wz=%d wn=%d test=%d left=%d mstart=%d track=%d hq=%d\n",
                  sub_mx, sub_my, sub_views, sub_wz, sub_wn,
-                 sub_test, sub_left, sub_mstart, sub_hq);
+                 sub_test, sub_left, sub_mstart, sub_track, sub_hq);
   }
 
   const bool two_pass = !post_fs_file.empty();
@@ -635,6 +693,7 @@ int main(int argc, char** argv) {
   GLint post_loc_test = -1;
   GLint post_loc_left = -1;
   GLint post_loc_mstart = -1;
+  GLint post_loc_track = -1;
   GLint post_loc_hq = -1;
   GLint post_loc_atlas_flip_y = -1;
   GLint post_loc_res = -1;
@@ -647,15 +706,16 @@ int main(int argc, char** argv) {
     post_loc_test = glGetUniformLocation(prog_post, "test");
     post_loc_left = glGetUniformLocation(prog_post, "left");
     post_loc_mstart = glGetUniformLocation(prog_post, "mstart");
+    post_loc_track = glGetUniformLocation(prog_post, "track");
     post_loc_hq = glGetUniformLocation(prog_post, "hq");
     post_loc_atlas_flip_y = glGetUniformLocation(prog_post, "atlas_flip_y");
     post_loc_res = glGetUniformLocation(prog_post, "u_resolution");
 
     if (debug) {
       std::fprintf(stderr,
-                   "[rock5b_hdmiin_gl] postpass uniform locations: mx=%d my=%d views=%d wz=%d wn=%d test=%d left=%d mstart=%d hq=%d res=%d\n",
+                   "[rock5b_hdmiin_gl] postpass uniform locations: mx=%d my=%d views=%d wz=%d wn=%d test=%d left=%d mstart=%d track=%d hq=%d res=%d\n",
                    post_loc_mx, post_loc_my, post_loc_views, post_loc_wz, post_loc_wn,
-                   post_loc_test, post_loc_left, post_loc_mstart, post_loc_hq, post_loc_res);
+                   post_loc_test, post_loc_left, post_loc_mstart, post_loc_track, post_loc_hq, post_loc_res);
     }
 
     glUseProgram(prog_post);
@@ -667,6 +727,7 @@ int main(int argc, char** argv) {
     if (post_loc_test >= 0) glUniform1i(post_loc_test, sub_test);
     if (post_loc_left >= 0) glUniform1i(post_loc_left, sub_left);
     if (post_loc_mstart >= 0) glUniform1i(post_loc_mstart, sub_mstart);
+    if (post_loc_track >= 0) glUniform1i(post_loc_track, sub_track);
     if (post_loc_hq >= 0) glUniform1i(post_loc_hq, sub_hq);
     if (post_loc_atlas_flip_y >= 0) glUniform1i(post_loc_atlas_flip_y, sub_atlas_flip_y);
     if (post_loc_res >= 0) glUniform2i(post_loc_res, (int)gfx.mode_hdisplay, (int)gfx.mode_vdisplay);
@@ -820,7 +881,131 @@ int main(int argc, char** argv) {
   timespec last_stat{};
   clock_gettime(CLOCK_MONOTONIC, &last_stat);
   uint32_t early_dbg_frames = 0;
+
+  // Optional interactive track control from a terminal.
+  // Enabled explicitly via --track-keys.
+  int stdin_flags_old = -1;
+  bool stdin_raw_enabled = false;
+  termios stdin_term_old{};
+  if (track_keys && isatty(STDIN_FILENO)) {
+    stdin_flags_old = fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (stdin_flags_old >= 0) (void)fcntl(STDIN_FILENO, F_SETFL, stdin_flags_old | O_NONBLOCK);
+
+    if (tcgetattr(STDIN_FILENO, &stdin_term_old) == 0) {
+      termios t = stdin_term_old;
+      cfmakeraw(&t);
+      // Keep Ctrl-C (SIGINT) working while in "raw" mode.
+      t.c_lflag |= ISIG;
+      t.c_oflag |= OPOST;
+      if (tcsetattr(STDIN_FILENO, TCSANOW, &t) == 0) {
+        stdin_raw_enabled = true;
+      }
+    }
+    std::fprintf(stderr,
+                 "[rock5b_hdmiin_gl] track keys enabled: left/right=+/-1 up/down=+/-10 r=reset q=quit\n");
+  }
+
+  auto restore_stdin = [&]() {
+    if (stdin_raw_enabled) {
+      (void)tcsetattr(STDIN_FILENO, TCSANOW, &stdin_term_old);
+      stdin_raw_enabled = false;
+    }
+    if (stdin_flags_old >= 0) {
+      (void)fcntl(STDIN_FILENO, F_SETFL, stdin_flags_old);
+      stdin_flags_old = -1;
+    }
+  };
+
   while (g_running) {
+    // Apply signal-driven track adjustments.
+    if (g_track_delta != 0) {
+      const int d = (int)g_track_delta;
+      g_track_delta = 0;
+      sub_track += d;
+      wrap_track_in_place();
+      std::fprintf(stderr, "[rock5b_hdmiin_gl] track=%d\n", sub_track);
+    }
+
+    // Optional keyboard-driven track adjustments (only when --track-keys and a TTY).
+    // We buffer bytes because arrow key escape sequences often arrive split across reads.
+    if (track_keys && isatty(STDIN_FILENO)) {
+      static std::string kb;
+      unsigned char buf[64];
+      for (;;) {
+        const ssize_t n = ::read(STDIN_FILENO, buf, sizeof(buf));
+        if (n <= 0) break;
+        kb.append((const char*)buf, (size_t)n);
+        if (kb.size() > 128) kb.erase(0, kb.size() - 128);
+      }
+
+      while (!kb.empty()) {
+        const unsigned char c = (unsigned char)kb[0];
+
+        // Also accept Ctrl-C as a quit key (in case ISIG is not available for some reason).
+        if (c == 0x03) {
+          g_running = 0;
+          kb.erase(0, 1);
+          break;
+        }
+
+        if (c == 'q' || c == 'Q') {
+          g_running = 0;
+          kb.erase(0, 1);
+          break;
+        }
+        if (c == 'r' || c == 'R') {
+          sub_track = 0;
+          wrap_track_in_place();
+          std::fprintf(stderr, "[rock5b_hdmiin_gl] track=%d\n", sub_track);
+          kb.erase(0, 1);
+          continue;
+        }
+
+        // Arrow keys: ESC [ A/B/C/D
+        if (c == 27) {
+          if (kb.size() < 3) break;  // wait for more bytes
+          if ((unsigned char)kb[1] == '[') {
+            const unsigned char k = (unsigned char)kb[2];
+            if (k == 'D') {
+              sub_track -= 1;
+              wrap_track_in_place();
+              std::fprintf(stderr, "[rock5b_hdmiin_gl] track=%d\n", sub_track);
+              kb.erase(0, 3);
+              continue;
+            }
+            if (k == 'C') {
+              sub_track += 1;
+              wrap_track_in_place();
+              std::fprintf(stderr, "[rock5b_hdmiin_gl] track=%d\n", sub_track);
+              kb.erase(0, 3);
+              continue;
+            }
+            if (k == 'A') {
+              sub_track += 10;
+              wrap_track_in_place();
+              std::fprintf(stderr, "[rock5b_hdmiin_gl] track=%d\n", sub_track);
+              kb.erase(0, 3);
+              continue;
+            }
+            if (k == 'B') {
+              sub_track -= 10;
+              wrap_track_in_place();
+              std::fprintf(stderr, "[rock5b_hdmiin_gl] track=%d\n", sub_track);
+              kb.erase(0, 3);
+              continue;
+            }
+          }
+
+          // Unknown escape sequence; drop ESC to avoid getting stuck.
+          kb.erase(0, 1);
+          continue;
+        }
+
+        // Ignore other keys.
+        kb.erase(0, 1);
+      }
+    }
+
     if (test_clear) {
       frame_counter++;
       const float t = (float)(frame_counter % 120) / 120.0f;
@@ -1195,6 +1380,7 @@ int main(int argc, char** argv) {
       if (post_loc_test >= 0) glUniform1i(post_loc_test, sub_test);
       if (post_loc_left >= 0) glUniform1i(post_loc_left, sub_left);
       if (post_loc_mstart >= 0) glUniform1i(post_loc_mstart, sub_mstart);
+      if (post_loc_track >= 0) glUniform1i(post_loc_track, sub_track);
       if (post_loc_hq >= 0) glUniform1i(post_loc_hq, sub_hq);
       if (post_loc_atlas_flip_y >= 0) glUniform1i(post_loc_atlas_flip_y, sub_atlas_flip_y);
       if (post_loc_res >= 0) glUniform2i(post_loc_res, (int)gfx.mode_hdisplay, (int)gfx.mode_vdisplay);
@@ -1273,6 +1459,8 @@ int main(int argc, char** argv) {
       }
     }
   }
+
+  restore_stdin();
 
   if (use_zero_copy) {
     if (displayed_v4l2_index >= 0) {
